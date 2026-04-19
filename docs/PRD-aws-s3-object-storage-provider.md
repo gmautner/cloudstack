@@ -475,3 +475,7 @@ When modifying proxy code:
 - Unit tests for driver methods (mock AWS SDK calls).
 - Integration tests against real S3 using the dev account credentials.
 - Manual testing through CloudStack UI: create/delete buckets, verify in S3 console.
+
+## 14. Backlog
+
+- **Hide encryption toggle in UI for AWS-S3 provider.** AWS S3 enforces SSE-S3 (AES-256) on all buckets and objects by default since January 2023 — there is no way to disable it. The CloudStack encryption flag is misleading for this provider. Research whether the UI can conditionally hide or disable the encryption toggle based on the provider type, or whether the plugin should simply report encryption as always enabled.
