@@ -82,7 +82,7 @@ CloudStack-issued credentials are synthetic: they authenticate requests to the S
 
 ### 4.4 Transparent Bucket Naming
 
-Bucket names visible to CloudStack users are identical to the actual S3 bucket names. No prefixing, mangling, or mapping. This is a hard requirement for STS credential forwarding — scoped IAM policies reference bucket ARNs by name.
+Bucket names visible to CloudStack users are identical to the actual S3 bucket names. No prefixing, mangling, or mapping. This is a hard requirement for STS credential forwarding — scoped IAM policies reference bucket ARNs by name. Users have full freedom to choose any valid S3 bucket name.
 
 Since S3 bucket names are globally unique, the provider must handle name collisions:
 - On `createBucket`, call S3 `HeadBucket` first.
@@ -180,7 +180,6 @@ Parameters stored in `object_store_details`:
 | `accesskey` | AWS IAM access key (service account) | `AKIA...` |
 | `secretkey` | AWS IAM secret key (service account) | `wJal...` |
 | `region` | AWS region | `sa-east-1` |
-| `role-arn` | IAM role ARN for AssumeRole | `arn:aws:iam::123:role/cs-s3-role` |
 | `sts-proxy-url` | URL of the STS proxy (informational, for user display) | `https://sts.example.com` |
 | `s3-proxy-url` | URL of the S3 proxy (informational, for user display) | `https://s3proxy.example.com` |
 
@@ -411,34 +410,20 @@ Since S3 bucket names are globally unique:
 
 ## 10. AWS Prerequisites
 
-The operator must set up the following in their AWS account before configuring the provider:
+The operator must set up the following:
 
-1. **IAM User** (service account) with programmatic access.
-2. **IAM Role** with:
-   - Trust policy allowing the service account to assume it.
-   - Permission policy granting `s3:*` on the desired bucket namespace and `s3:ListAllMyBuckets`.
+1. **A dedicated AWS account** for the object storage provider. This isolates CloudStack-managed buckets from other infrastructure.
+2. **An IAM user** (service account) in that account with programmatic access and S3/STS permissions.
 3. **S3 access** in the target region.
 
-Example role permission policy:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "s3:*",
-      "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"]
-    },
-    {
-      "Effect": "Allow",
-      "Action": "s3:ListAllMyBuckets",
-      "Resource": "arn:aws:s3:::*"
-    }
-  ]
-}
-```
+The service account credentials are used directly by the management server for bucket admin operations and by the proxies for STS AssumeRole calls.
 
-(Operators may narrow the resource scope to a prefix pattern for additional safety.)
+### Dev environment (current setup)
+
+- **Account:** `211125662649` (dedicated account for this project)
+- **IAM user:** `s3-cloudstack-provider-dev`
+- **Credentials:** `~/.env.s3-cloudstack-provider-dev`
+- **Region:** `sa-east-1`
 
 ## 11. Configuration Summary
 
@@ -447,7 +432,6 @@ Example role permission policy:
 | AWS Access Key | `object_store_details.accesskey` | Service account access key |
 | AWS Secret Key | `object_store_details.secretkey` | Service account secret key |
 | Region | `object_store_details.region` | AWS region (e.g., `sa-east-1`) |
-| Role ARN | `object_store_details.role-arn` | IAM role for AssumeRole |
 | STS Proxy URL | `object_store_details.sts-proxy-url` | For display to users |
 | S3 Proxy URL | `object_store_details.s3-proxy-url` | For display to users |
 | Object Store URL | `object_store.url` | S3 regional endpoint |
