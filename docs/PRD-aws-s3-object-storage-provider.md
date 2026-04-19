@@ -62,13 +62,13 @@ The provider ships with two companion proxy services that give CloudStack users 
 
 ### 4.2 Single Upstream IAM Identity
 
-One IAM role + one IAM user (the service account) for the entire provider:
+One IAM user (the service account) and one IAM role for the entire provider:
 
-- **Service account**: Long-lived IAM credentials held by the management server and both proxies. Used to call `STS:AssumeRole` and to perform bucket admin operations (create, delete, configure).
-- **IAM role**: Defines the maximum permission boundary. Trust policy allows the service account to assume it. Role policy grants `s3:*` on a configurable bucket name pattern and `s3:ListAllMyBuckets`.
-- **Session policies**: Built per-user at AssumeRole time. Each session policy scopes access to only the buckets owned by that CloudStack account.
+- **Service account** (IAM user): Long-lived credentials held by the management server and both proxies. Used directly for bucket admin operations (create, delete, configure) and to call `STS:AssumeRole`.
+- **IAM role**: Used exclusively for STS AssumeRole. The role has broad S3 permissions (full `s3:*`); the actual per-tenant scoping is done entirely by the session policy attached to each AssumeRole call. The role's trust policy allows only the service account to assume it.
+- **Session policies**: Built per-account at AssumeRole time. Each session policy scopes access to only the buckets owned by that CloudStack account and denies all bucket-admin operations (see section 5.6).
 
-No per-user IAM users or long-lived AWS keys are created in the upstream account.
+No per-user IAM users or long-lived AWS keys are created in the upstream account. The role exists solely as a vehicle for STS session policy scoping.
 
 ### 4.3 Credential Model
 
@@ -150,6 +150,16 @@ Both modes can run simultaneously. Operators choose which to deploy based on the
 
 ## 5. CloudStack Plugin Design
 
+### 5.0 Modularity Constraint
+
+The plugin must not modify any existing CloudStack core files. All code lives in the new plugin module (`plugins/storage/object/s3/`) and is enabled via Maven profile or compiler flag, the same way the MinIO, Ceph, and Simulator object storage plugins are included. This ensures:
+
+- The plugin can be cleanly merged into the upstream Apache CloudStack repository as a self-contained module.
+- Existing CloudStack builds are unaffected unless the operator explicitly enables the plugin.
+- The plugin relies only on public interfaces (`ObjectStoreProvider`, `ObjectStoreDriver`, `ObjectStoreLifeCycle`, `BaseObjectStoreDriverImpl`) and the existing `account_details` / `object_store_details` database tables — no schema migrations, no core class modifications.
+
+If a feature cannot be implemented without touching core, it must be flagged and discussed before proceeding. The goal is a zero-diff on all files outside `plugins/storage/object/s3/`.
+
 ### 5.1 Plugin Structure
 
 ```
@@ -180,6 +190,7 @@ Parameters stored in `object_store_details`:
 | `accesskey` | AWS IAM access key (service account) | `AKIA...` |
 | `secretkey` | AWS IAM secret key (service account) | `wJal...` |
 | `region` | AWS region | `sa-east-1` |
+| `role-arn` | IAM role ARN for STS AssumeRole (session policy scoping) | `arn:aws:iam::211125662649:role/cloudstack-s3-dev` |
 | `sts-proxy-url` | URL of the STS proxy (informational, for user display) | `https://sts.example.com` |
 | `s3-proxy-url` | URL of the S3 proxy (informational, for user display) | `https://s3proxy.example.com` |
 
@@ -422,6 +433,7 @@ The service account credentials are used directly by the management server for b
 
 - **Account:** `211125662649` (dedicated account for this project)
 - **IAM user:** `s3-cloudstack-provider-dev`
+- **IAM role ARN:** `arn:aws:iam::211125662649:role/cloudstack-s3-dev`
 - **Credentials:** `~/.env.s3-cloudstack-provider-dev`
 - **Region:** `sa-east-1`
 
@@ -432,13 +444,38 @@ The service account credentials are used directly by the management server for b
 | AWS Access Key | `object_store_details.accesskey` | Service account access key |
 | AWS Secret Key | `object_store_details.secretkey` | Service account secret key |
 | Region | `object_store_details.region` | AWS region (e.g., `sa-east-1`) |
+| Role ARN | `object_store_details.role-arn` | IAM role for STS session policy scoping |
 | STS Proxy URL | `object_store_details.sts-proxy-url` | For display to users |
 | S3 Proxy URL | `object_store_details.s3-proxy-url` | For display to users |
 | Object Store URL | `object_store.url` | S3 regional endpoint |
 
-## 12. Testing Strategy
+## 12. Proxy Compatibility Baseline
+
+The S3 proxy (`~/s3-proxy-poc`) has been extensively tuned against two S3 compatibility test suites. Any changes to proxy logic must preserve these results — regressions are not acceptable.
+
+### Current test results (from s3-proxy-poc)
+
+**Ceph s3-tests** (453 object-operation tests, excluding `@pytest.mark.fails_on_aws` and bucket-admin tests):
+- 281 passed (62%)
+- 0 proxy bugs remaining
+- Only 4 tests behind direct-to-AWS (no proxy)
+- Failures are AWS behavioral differences (59), not-applicable Ceph-specific tests (37), and architectural limitations (shared assumed role model)
+
+**MinIO Mint** (3 suites):
+- aws-sdk-go-v2: 21/21 passed
+- versioning: 12/12 passed
+- minio-go: 54/73 passed (failures are AWS behavioral differences or architectural limitations)
+
+### Testing policy
+
+When modifying proxy code:
+1. Run the full Ceph s3-tests suite and verify pass count does not decrease from the baseline in `~/s3-proxy-poc/README.md`.
+2. Run the MinIO Mint suites and verify no regressions.
+3. Follow the exact test setup and configuration documented in `~/s3-proxy-poc/README.md` (including the `s3tests-harness-fix.patch`).
+4. Preserve all proxy fixups (aws-chunked decoding, SSE-C pass-through, CreateBucket LocationConstraint injection, post-creation ACL/ownership fixups, bypass-governance retry, header casing). These were hand-tuned to pass the test suites — do not simplify, refactor, or remove them without re-running the full suites.
+
+## 13. Testing Strategy (CloudStack Plugin)
 
 - Unit tests for driver methods (mock AWS SDK calls).
-- Integration tests against LocalStack or real S3.
-- S3 compatibility tests using Ceph s3-tests suite (same as used for s3-proxy-poc, target 62%+ pass rate).
+- Integration tests against real S3 using the dev account credentials.
 - Manual testing through CloudStack UI: create/delete buckets, verify in S3 console.
