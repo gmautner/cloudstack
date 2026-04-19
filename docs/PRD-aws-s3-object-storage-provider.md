@@ -95,12 +95,43 @@ Since S3 bucket names are globally unique, the provider must handle name collisi
 
 Based on `~/sts-poc`.
 
-- Client configures AWS CLI/SDK with CloudStack-issued credentials and an `endpoint_url` pointing to the STS proxy.
-- Client's SDK calls `AssumeRole` against the STS proxy.
-- Proxy verifies SigV4 signature using CloudStack-issued secret key.
-- Proxy calls real `STS:AssumeRole` with the service account's credentials and a session policy scoped to the authenticated user's buckets.
-- Proxy returns temporary AWS credentials (access key, secret key, session token, expiration) in standard STS XML format.
-- Client uses temporary credentials directly against S3 (proxy not in data path).
+The client configures an AWS CLI profile that redirects only the STS service to the proxy. The SDK handles AssumeRole transparently — the client never calls it explicitly.
+
+**AWS CLI configuration (`~/.aws/config` and `~/.aws/credentials`):**
+
+```ini
+# ~/.aws/credentials
+[cloudstack-source]
+aws_access_key_id = <CloudStack-issued access key>
+aws_secret_access_key = <CloudStack-issued secret key>
+
+# ~/.aws/config
+[profile cloudstack-s3]
+role_arn = <IAM role ARN from provider config>
+source_profile = cloudstack-source
+region = sa-east-1
+services = cloudstack-svc
+
+[services cloudstack-svc]
+sts =
+  endpoint_url = http://<sts-proxy-host>:8085
+```
+
+**Or equivalently via environment variables:**
+
+```bash
+export AWS_ACCESS_KEY_ID=<CloudStack-issued access key>
+export AWS_SECRET_ACCESS_KEY=<CloudStack-issued secret key>
+export AWS_ROLE_ARN=<IAM role ARN from provider config>
+export AWS_REGION=sa-east-1
+export AWS_ENDPOINT_URL_STS=http://<sts-proxy-host>:8085
+```
+
+**Flow:**
+- The SDK calls `AssumeRole` against the STS proxy using the CloudStack-issued credentials.
+- Proxy verifies the SigV4 signature, then calls real `STS:AssumeRole` with the service account's credentials and a session policy scoped to the authenticated account's buckets.
+- Proxy returns temporary AWS credentials in standard STS XML format.
+- The SDK caches the temporary credentials and uses them directly against real S3 (proxy not in data path).
 
 Best for: clients using standard AWS SDKs, high-throughput workloads, large file transfers.
 
@@ -212,18 +243,37 @@ The proxies read these credentials from the CloudStack database (or a synced cre
 
 ### 5.6 Session Policy Construction
 
+Bucket lifecycle and settings are managed exclusively through CloudStack. The session policy must deny all bucket-level administrative operations so users cannot bypass CloudStack by calling S3 directly.
+
 When a proxy needs to build a session policy for a given CloudStack account, it:
 
 1. Queries the `bucket` table for all buckets owned by that account in state `Created`.
-2. Builds a policy document:
+2. Builds a policy document with an explicit deny for bucket admin operations:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowObjectOperations",
       "Effect": "Allow",
-      "Action": "s3:*",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:ListBucketMultipartUploads",
+        "s3:ListMultipartUploadParts",
+        "s3:AbortMultipartUpload",
+        "s3:PutObjectAcl",
+        "s3:GetObjectAcl",
+        "s3:GetObjectVersion",
+        "s3:DeleteObjectVersion",
+        "s3:PutObjectTagging",
+        "s3:GetObjectTagging",
+        "s3:DeleteObjectTagging"
+      ],
       "Resource": [
         "arn:aws:s3:::<bucket1>",
         "arn:aws:s3:::<bucket1>/*",
@@ -232,17 +282,44 @@ When a proxy needs to build a session policy for a given CloudStack account, it:
       ]
     },
     {
+      "Sid": "AllowListBuckets",
       "Effect": "Allow",
       "Action": "s3:ListAllMyBuckets",
+      "Resource": "arn:aws:s3:::*"
+    },
+    {
+      "Sid": "DenyBucketAdmin",
+      "Effect": "Deny",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration",
+        "s3:DeleteEncryptionConfiguration",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:PutBucketAcl",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutPublicAccessBlock",
+        "s3:DeletePublicAccessBlock",
+        "s3:PutObjectLockConfiguration",
+        "s3:PutBucketTagging",
+        "s3:DeleteBucketTagging"
+      ],
       "Resource": "arn:aws:s3:::*"
     }
   ]
 }
 ```
 
+**Design rationale:**
+- The Allow statement uses an explicit action list (not `s3:*`) to grant only object-level data operations. This is the whitelist of what users can do directly.
+- The Deny statement explicitly blocks all bucket-level administrative operations. Even if the Allow list is accidentally broadened, the Deny takes precedence (AWS always honors explicit Deny over Allow).
+- Bucket creation/deletion, versioning, encryption, policies, ACLs, public access, and object lock configuration are all reserved for the CloudStack management server, which uses the service account credentials directly (not STS).
+
 3. Passes this as the `Policy` parameter to `STS:AssumeRole`.
 
-AWS enforces the intersection of this session policy with the role's permission policy, ensuring a user can never access buckets outside their own set.
+AWS enforces the intersection of this session policy with the role's permission policy, ensuring a user can never access buckets outside their own set or perform bucket admin operations.
 
 ## 6. Proxy Services
 
