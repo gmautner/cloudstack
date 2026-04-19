@@ -235,7 +235,7 @@ Extends `BaseObjectStoreDriverImpl`. Key method implementations:
 - Enforcement is advisory: the provider tracks usage via `getAllBucketsUsage` and can alert, but cannot block writes at the S3 level.
 
 #### getAllBucketsUsage(storeId)
-- Use CloudWatch `BucketSizeBytes` metric or `S3:ListBuckets` + `HeadBucket` for usage.
+- Use CloudWatch `BucketSizeBytes` metric for usage. Note: this metric is reported daily with ~48 hour delay, so usage data is advisory, not real-time.
 - Return map of bucket name to size in bytes.
 
 ### 5.5 Credential Storage
@@ -292,15 +292,10 @@ When a proxy needs to build a session policy for a given CloudStack account, it:
       ]
     },
     {
-      "Sid": "AllowListBuckets",
-      "Effect": "Allow",
-      "Action": "s3:ListAllMyBuckets",
-      "Resource": "arn:aws:s3:::*"
-    },
-    {
       "Sid": "DenyBucketAdmin",
       "Effect": "Deny",
       "Action": [
+        "s3:ListAllMyBuckets",
         "s3:CreateBucket",
         "s3:DeleteBucket",
         "s3:PutBucketVersioning",
@@ -323,8 +318,9 @@ When a proxy needs to build a session policy for a given CloudStack account, it:
 ```
 
 **Design rationale:**
-- The Allow statement uses an explicit action list (not `s3:*`) to grant only object-level data operations. This is the whitelist of what users can do directly.
-- The Deny statement explicitly blocks all bucket-level administrative operations. Even if the Allow list is accidentally broadened, the Deny takes precedence (AWS always honors explicit Deny over Allow).
+- The Allow statement uses an explicit action list (not `s3:*`) to grant only object-level data operations on the account's specific buckets.
+- The Deny statement explicitly blocks all bucket-level administrative operations and `ListAllMyBuckets`. Even if the Allow list is accidentally broadened, the Deny takes precedence (AWS always honors explicit Deny over Allow).
+- `ListAllMyBuckets` is denied because it cannot be scoped to specific buckets in AWS and would expose all bucket names in the account. Bucket listing is a CloudStack-level feature served from the CloudStack database, not from S3.
 - Bucket creation/deletion, versioning, encryption, policies, ACLs, public access, and object lock configuration are all reserved for the CloudStack management server, which uses the service account credentials directly (not STS).
 
 3. Passes this as the `Policy` parameter to `STS:AssumeRole`.
