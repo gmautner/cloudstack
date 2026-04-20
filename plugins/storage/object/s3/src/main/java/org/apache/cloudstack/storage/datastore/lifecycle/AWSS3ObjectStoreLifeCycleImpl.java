@@ -18,10 +18,6 @@
  */
 package org.apache.cloudstack.storage.datastore.lifecycle;
 
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.cloud.agent.api.StoragePoolInfo;
 import com.cloud.hypervisor.Hypervisor.HypervisorType;
 import com.cloud.utils.exception.CloudRuntimeException;
@@ -37,6 +33,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import javax.inject.Inject;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -62,29 +61,37 @@ public class AWSS3ObjectStoreLifeCycleImpl implements ObjectStoreLifeCycle {
         Map<String, String> details = (Map<String, String>) dsInfos.get("details");
 
         if (details == null) {
-            throw new CloudRuntimeException("AWS S3 credentials are missing");
+            throw new CloudRuntimeException("S3 middleware configuration is missing");
         }
 
-        String accessKey = details.get("accesskey");
-        String secretKey = details.get("secretkey");
-        String region = details.get("region");
+        String adminUrl = details.get("adminurl");
+        String apiKey = details.get("apikey");
 
-        if (accessKey == null || secretKey == null || region == null) {
-            throw new CloudRuntimeException("AWS S3 requires accesskey, secretkey, and region");
+        if (adminUrl == null || apiKey == null) {
+            throw new CloudRuntimeException("S3 middleware requires adminurl and apikey");
         }
 
-        // Validate credentials by listing buckets
+        // Validate connectivity by calling the health endpoint
         try {
-            AmazonS3 s3Client = AmazonS3ClientBuilder.standard()
-                    .withRegion(region)
-                    .withCredentials(new AWSStaticCredentialsProvider(
-                            new BasicAWSCredentials(accessKey, secretKey)))
-                    .build();
-            s3Client.listBuckets();
-            logger.debug("Successfully connected to AWS S3 in region: " + region);
+            URL healthUrl = new URL(adminUrl + "/admin/health");
+            HttpURLConnection conn = (HttpURLConnection) healthUrl.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("Authorization", "Bearer " + apiKey);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+
+            int status = conn.getResponseCode();
+            InputStream is = (status >= 200 && status < 300) ? conn.getInputStream() : conn.getErrorStream();
+            String body = new String(is.readAllBytes());
+            is.close();
+
+            if (status != 200) {
+                throw new RuntimeException("Health check failed (" + status + "): " + body);
+            }
+            logger.debug("Successfully connected to S3 middleware at: " + adminUrl);
         } catch (Exception e) {
             logger.debug("Error while initializing AWS S3 Object Store: " + e.getMessage());
-            throw new RuntimeException("Error while initializing AWS S3 Object Store. Invalid credentials or region: " + e.getMessage());
+            throw new RuntimeException("Error while initializing AWS S3 Object Store. Cannot reach S3 middleware at " + adminUrl + ": " + e.getMessage());
         }
 
         Map<String, Object> objectStoreParameters = new HashMap<>();
