@@ -4,7 +4,7 @@
 
 A new CloudStack object storage provider plugin that uses AWS S3 as the backing store. Unlike the existing MinIO provider (which manages a self-hosted MinIO instance), this provider delegates bucket storage to a real AWS S3 region and provides tenant isolation through STS AssumeRole with scoped session policies.
 
-The provider ships with two companion proxy services that give CloudStack users S3-compatible access to their buckets without ever exposing the upstream AWS IAM credentials.
+The provider ships with a companion service — the **S3 middleware** — that provides S3-compatible access to tenants' buckets without ever exposing the upstream AWS IAM credentials. The S3 middleware is a single Go binary that exposes STS and S3 proxy endpoints on separate ports, manages all AWS interaction (bucket CRUD, STS AssumeRole, session policy construction), and maintains its own Postgres database of credentials and bucket-to-account mappings. The CloudStack plugin communicates with the middleware via an admin API, following the same pattern as the MinIO plugin communicates with MinIO.
 
 ## 2. Goals
 
@@ -26,45 +26,54 @@ The provider ships with two companion proxy services that give CloudStack users 
 ### 4.1 Components
 
 ```
-                CloudStack Management Server
-                ┌──────────────────────────────────┐
-                │  BucketApiServiceImpl             │
-                │       │                           │
-                │  AWSS3ObjectStoreDriverImpl        │
-                │   (creates/deletes buckets in S3) │
-                │   (manages credentials in DB)     │
-                └──────────┬───────────────────────┘
-                           │ AWS SDK (service account)
-                           ▼
-                     ┌──────────┐
-                     │  AWS S3  │ (sa-east-1)
-                     │  AWS STS │
-                     │  AWS IAM │
-                     └──────────┘
-                           ▲
-              ┌────────────┼────────────────┐
-              │                             │
-     ┌────────┴─────────┐        ┌─────────┴────────┐
-     │   STS Proxy       │        │   S3 Proxy        │
-     │ (credential       │        │ (reverse proxy    │
-     │  vending only)    │        │  in data path)    │
-     └────────┬─────────┘        └─────────┬────────┘
-              │                             │
-              │  STS tokens                 │  endpoint-url
-              ▼                             ▼
-     ┌────────────────┐          ┌────────────────┐
-     │ Client (direct │          │ Client (legacy  │
-     │ to S3 with     │          │ software, uses  │
-     │ temp creds)    │          │ proxy as S3     │
-     └────────────────┘          │ endpoint)       │
-                                 └────────────────┘
+     CloudStack Management Server
+     ┌──────────────────────────────────┐
+     │  BucketApiServiceImpl             │
+     │       │                           │
+     │  AWSS3ObjectStoreDriverImpl       │
+     │   (thin wrapper, calls           │
+     │    middleware admin API)          │
+     └──────────┬───────────────────────┘
+                │ Admin API (HTTP)
+                ▼
+     ┌──────────────────────────────────────────────┐
+     │             S3 Middleware                      │
+     │         (single Go binary)                    │
+     │                                               │
+     │  ┌─────────────┐  ┌──────────┐  ┌─────────┐ │
+     │  │ Admin API    │  │ STS      │  │ S3      │ │
+     │  │ :8090        │  │ :8085    │  │ :9000   │ │
+     │  │ (user/bucket │  │ (cred    │  │ (reverse│ │
+     │  │  management) │  │  vending)│  │  proxy) │ │
+     │  └──────────────┘  └──────────┘  └─────────┘ │
+     │              │                                │
+     │  ┌───────────┴───────────────┐                │
+     │  │ Postgres (credentials,    │                │
+     │  │  bucket-account mappings) │                │
+     │  └───────────────────────────┘                │
+     └──────────────────┬───────────────────────────┘
+                        │ AWS SDK (service account)
+                        ▼
+                  ┌──────────┐
+                  │  AWS S3  │ (sa-east-1)
+                  │  AWS STS │
+                  └──────────┘
+                        ▲
+           ┌────────────┼────────────────┐
+           │                             │
+  ┌────────┴─────────┐        ┌─────────┴────────┐
+  │ Client (direct   │        │ Client (legacy    │
+  │ to S3 with       │        │ software, uses    │
+  │ STS temp creds)  │        │ S3 proxy as       │
+  └──────────────────┘        │ endpoint)         │
+                              └──────────────────┘
 ```
 
 ### 4.2 Single Upstream IAM Identity
 
 One IAM user (the service account) and one IAM role for the entire provider:
 
-- **Service account** (IAM user): Long-lived credentials held by the management server and both proxies. Used directly for bucket admin operations (create, delete, configure) and to call `STS:AssumeRole`.
+- **Service account** (IAM user): Long-lived credentials held by the S3 middleware. Used directly for bucket admin operations (create, delete, configure) and to call `STS:AssumeRole`. The CloudStack management server does not hold AWS credentials — all AWS interaction goes through the middleware.
 - **IAM role**: Used exclusively for STS AssumeRole. The role has broad S3 permissions (full `s3:*`); the actual per-tenant scoping is done entirely by the session policy attached to each AssumeRole call. The role's trust policy allows only the service account to assume it.
 - **Session policies**: Built per-account at AssumeRole time. Each session policy scopes access to only the buckets owned by that CloudStack account and denies all bucket-admin operations (see section 5.6).
 
@@ -74,11 +83,11 @@ No per-user IAM users or long-lived AWS keys are created in the upstream account
 
 | Credential Type | Held By | Scope | Lifetime |
 |---|---|---|---|
-| AWS IAM access/secret key | Management server, proxies | Service account | Permanent (rotated by operator) |
-| CloudStack-issued access/secret key | Per CloudStack account | Proxy authentication | Permanent (stored in DB) |
+| AWS IAM access/secret key | S3 middleware | Service account | Permanent (rotated by operator) |
+| CloudStack-issued access/secret key | Per CloudStack account | Middleware authentication | Permanent (stored in middleware Postgres) |
 | STS temporary credentials | Per client session | Scoped to account's buckets | 1 hour (renewable) |
 
-CloudStack-issued credentials are synthetic: they authenticate requests to the STS proxy or S3 proxy. They have no meaning to AWS. The proxies verify them via SigV4 signature verification and then call `STS:AssumeRole` with a session policy scoped to that account's buckets.
+CloudStack-issued credentials are synthetic: they authenticate requests to the middleware's STS and S3 endpoints. They have no meaning to AWS. The middleware verifies them via SigV4 signature verification and then calls `STS:AssumeRole` with a session policy scoped to that account's buckets. The CloudStack plugin also stores copies of these credentials in the `account_details` table for display in the UI.
 
 ### 4.4 Transparent Bucket Naming
 
@@ -187,77 +196,80 @@ Parameters stored in `object_store_details`:
 
 | Key | Description | Example |
 |---|---|---|
-| `accesskey` | AWS IAM access key (service account) | `AKIA...` |
-| `secretkey` | AWS IAM secret key (service account) | `wJal...` |
-| `region` | AWS region | `sa-east-1` |
-| `role-arn` | IAM role ARN for STS AssumeRole (session policy scoping) | `arn:aws:iam::211125662649:role/cloudstack-s3-dev` |
-| `sts-proxy-url` | URL of the STS proxy (informational, for user display) | `https://sts.example.com` |
-| `s3-proxy-url` | URL of the S3 proxy (informational, for user display) | `https://s3proxy.example.com` |
+| `adminurl` | S3 middleware admin API URL | `http://s3mw:8090` |
+| `apikey` | Admin API key for middleware authentication | `sk-...` |
+| `region` | AWS region (informational, for display) | `sa-east-1` |
+| `sts-endpoint` | STS endpoint URL (for user display/client config) | `https://sts.example.com:8085` |
+| `s3-endpoint` | S3 proxy endpoint URL (for user display/client config) | `https://s3proxy.example.com:9000` |
 
-The `url` field on the object store itself will hold the S3 regional endpoint (e.g., `https://s3.sa-east-1.amazonaws.com`).
+The `url` field on the object store itself will hold the S3 middleware admin API URL. AWS credentials are no longer stored in CloudStack — they are configured in the middleware only.
 
 ### 5.4 Driver Implementation (AWSS3ObjectStoreDriverImpl)
 
-Extends `BaseObjectStoreDriverImpl`. Key method implementations:
+Extends `BaseObjectStoreDriverImpl`. The driver is a thin wrapper that delegates all operations to the S3 middleware via its admin API, following the same pattern as the MinIO driver delegates to MinIO. No AWS SDK calls are made from the Java side.
 
 #### createUser(accountId, storeId)
-- Generate a random CloudStack-issued access key and secret key (synthetic, not AWS keys).
-- Store them in `account_details` table (same pattern as MinIO: keys `s3-accesskey`, `s3-secretkey`).
-- These credentials are what users will use to authenticate against the proxies.
+- Call middleware admin API: `POST /admin/users` with account identifier.
+- Middleware generates the synthetic access/secret key pair and stores them in its Postgres database.
+- Driver receives the credentials in the response and stores them in `account_details` table (keys `s3-accesskey`, `s3-secretkey`) for display in the CloudStack UI.
 
 #### createBucket(bucket, objectLock)
-- Using the service account's AWS credentials:
-  1. Call `S3:HeadBucket` to check if name is taken. If taken, throw error.
-  2. Call `S3:CreateBucket` with `LocationConstraint` set to the configured region.
-  3. Apply post-creation fixups (from s3-proxy-poc):
-     - `DeletePublicAccessBlock` — remove default Block Public Access.
-     - `PutBucketOwnershipControls` with `BucketOwnerPreferred` — enable ACLs.
-  4. Set the bucket URL on BucketVO to the standard S3 URL format.
-  5. Stamp account-level CloudStack-issued credentials onto the BucketVO.
+- Call middleware admin API: `POST /admin/buckets` with bucket name, account identifier, objectLock flag.
+- Middleware handles all AWS interaction internally:
+  1. `HeadBucket` collision check.
+  2. `CreateBucket` with `LocationConstraint`.
+  3. Post-creation fixups (`DeletePublicAccessBlock`, `PutBucketOwnershipControls`).
+  4. Records the bucket-to-account mapping in its Postgres database.
+- Driver stamps the account's credentials and bucket URL onto the BucketVO.
 
 #### deleteBucket(bucket, storeId)
-- Call `S3:DeleteBucket` using service account credentials.
-- Handle `BucketNotEmpty` error and surface it to the user.
+- Call middleware admin API: `DELETE /admin/buckets/{name}`.
+- Middleware calls `S3:DeleteBucket` and removes the mapping from its database.
+- Middleware surfaces `BucketNotEmpty` errors to the driver.
 
 #### setBucketEncryption / deleteBucketEncryption
-- Call `S3:PutBucketEncryption` / `S3:DeleteBucketEncryption` with SSE-S3 configuration.
+- Call middleware admin API to set/delete SSE-S3 encryption on the bucket.
 
 #### setBucketVersioning / deleteBucketVersioning
-- Call `S3:PutBucketVersioning` with `Enabled` or `Suspended`.
+- Call middleware admin API to enable/suspend versioning.
 
 #### setBucketPolicy / deleteBucketPolicy
-- Call `S3:PutBucketPolicy` / `S3:DeleteBucketPolicy`.
-- Support `public` and `private` presets (same as MinIO provider).
+- Call middleware admin API with `public` or `private` preset.
 
 #### setBucketQuota(bucket, storeId, size)
 - S3 does not natively support bucket quotas.
 - Store the quota value in CloudStack's database for tracking.
-- Enforcement is advisory: the provider tracks usage via `getAllBucketsUsage` and can alert, but cannot block writes at the S3 level.
+- Enforcement is advisory only.
 
 #### getAllBucketsUsage(storeId)
-- Use CloudWatch `BucketSizeBytes` metric for usage. Note: this metric is reported daily with ~48 hour delay, so usage data is advisory, not real-time.
-- Return map of bucket name to size in bytes.
+- Call middleware admin API which queries CloudWatch `BucketSizeBytes` metric.
+- Note: this metric is reported daily with ~48 hour delay, so usage data is advisory, not real-time.
 
 ### 5.5 Credential Storage
 
-CloudStack-issued credentials (synthetic access/secret keys for proxy authentication) are stored in the `account_details` table:
+Credentials exist in two places:
+
+**S3 middleware Postgres database (source of truth):**
+- Synthetic access/secret key pairs, per account.
+- Bucket-to-account mappings.
+- The middleware uses these to verify SigV4 signatures and build session policies.
+
+**CloudStack `account_details` table (copies for UI display):**
 
 | Key | Value |
 |---|---|
-| `s3-accesskey` | CloudStack-generated access key (e.g., `AKIACS<uuid-based>`) |
-| `s3-secretkey` | CloudStack-generated secret key (random base64) |
+| `s3-accesskey` | Access key (copy from middleware) |
+| `s3-secretkey` | Secret key (copy from middleware) |
 
-This follows the same pattern as the MinIO provider's `minio-accesskey` / `minio-secretkey`.
-
-The proxies read these credentials from the CloudStack database (or a synced credential store) to verify incoming SigV4 signatures.
+This follows the same pattern as the MinIO provider's `minio-accesskey` / `minio-secretkey`. The middleware is the authoritative store; CloudStack holds copies so the UI can display connection instructions to users.
 
 ### 5.6 Session Policy Construction
 
 Bucket lifecycle and settings are managed exclusively through CloudStack. The session policy must deny all bucket-level administrative operations so users cannot bypass CloudStack by calling S3 directly.
 
-When a proxy needs to build a session policy for a given CloudStack account, it:
+When the S3 middleware needs to build a session policy for a given account, it:
 
-1. Queries the `bucket` table for all buckets owned by that account in state `Created`.
+1. Queries its Postgres database for all buckets mapped to that account.
 2. Builds a policy document with an explicit deny for bucket admin operations:
 
 ```json
@@ -321,56 +333,105 @@ When a proxy needs to build a session policy for a given CloudStack account, it:
 - The Allow statement uses an explicit action list (not `s3:*`) to grant only object-level data operations on the account's specific buckets.
 - The Deny statement explicitly blocks all bucket-level administrative operations and `ListAllMyBuckets`. Even if the Allow list is accidentally broadened, the Deny takes precedence (AWS always honors explicit Deny over Allow).
 - `ListAllMyBuckets` is denied because it cannot be scoped to specific buckets in AWS and would expose all bucket names in the account. Bucket listing is a CloudStack-level feature served from the CloudStack database, not from S3.
-- Bucket creation/deletion, versioning, encryption, policies, ACLs, public access, and object lock configuration are all reserved for the CloudStack management server, which uses the service account credentials directly (not STS).
+- Bucket creation/deletion, versioning, encryption, policies, ACLs, public access, and object lock configuration are all reserved for the middleware's admin API, which uses the service account credentials directly (not STS).
 
 3. Passes this as the `Policy` parameter to `STS:AssumeRole`.
 
 AWS enforces the intersection of this session policy with the role's permission policy, ensuring a user can never access buckets outside their own set or perform bucket admin operations.
 
-## 6. Proxy Services
+## 6. S3 Middleware
 
-### 6.1 STS Proxy
+Single Go binary that consolidates the STS proxy, S3 proxy, and admin API into one self-contained service. Based on `~/sts-poc` and `~/s3-proxy-poc`.
 
-Standalone Go service. Based on `~/sts-poc`.
+### 6.1 Configuration
 
-**Configuration:**
-- `CLOUDSTACK_DB_DSN` or API endpoint for reading credentials and bucket mappings.
-- `AWS_ROLE_ARN` — the IAM role to assume.
-- `AWS_REGION` — target region.
-- AWS service account credentials (from environment or instance profile).
-- Listen address (default `:8085`).
+| Variable | Description | Default |
+|---|---|---|
+| `DATABASE_URL` | Postgres connection string | (required) |
+| `AWS_ACCESS_KEY_ID` | Service account access key | (required) |
+| `AWS_SECRET_ACCESS_KEY` | Service account secret key | (required) |
+| `AWS_ROLE_ARN` | IAM role ARN for STS AssumeRole | (required) |
+| `AWS_REGION` | Target S3 region | `sa-east-1` |
+| `ADMIN_API_KEY` | API key for admin API authentication | (required) |
+| `ADMIN_ALLOWED_IPS` | Comma-separated IP allowlist for admin API | `127.0.0.1` |
+| `ADMIN_LISTEN` | Admin API listen address | `:8090` |
+| `STS_LISTEN` | STS endpoint listen address | `:8085` |
+| `S3_LISTEN` | S3 proxy endpoint listen address | `:9000` |
 
-**Endpoints:**
-- `POST /` — handles `Action=AssumeRole` requests signed with CloudStack-issued credentials.
+### 6.2 Postgres Schema
+
+The middleware owns its database with (at minimum) these tables:
+
+- **`accounts`**: account identifier, access key, secret key.
+- **`buckets`**: bucket name, account FK, created timestamp.
+
+The middleware is the source of truth for credentials and bucket mappings. CloudStack holds copies in its own database for UI display only.
+
+### 6.3 Admin API (port 8090)
+
+Internal API called by the CloudStack plugin driver. Not exposed to end users. Secured by two mechanisms:
+
+1. **API key authentication**: Every request must include an `Authorization: Bearer <ADMIN_API_KEY>` header. The key is configured via the `ADMIN_API_KEY` environment variable on the middleware and stored in `object_store_details` (key `apikey`) on the CloudStack side.
+2. **IP allowlist**: The middleware only accepts admin API connections from IPs listed in `ADMIN_ALLOWED_IPS` (comma-separated, default `127.0.0.1`). Requests from other IPs are rejected with 403.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/admin/users` | Create account with generated credentials |
+| `GET` | `/admin/users/{id}` | Get account credentials |
+| `DELETE` | `/admin/users/{id}` | Delete account |
+| `POST` | `/admin/buckets` | Create bucket (S3 + Postgres) |
+| `DELETE` | `/admin/buckets/{name}` | Delete bucket (S3 + Postgres) |
+| `PUT` | `/admin/buckets/{name}/encryption` | Set/delete SSE-S3 encryption |
+| `PUT` | `/admin/buckets/{name}/versioning` | Enable/suspend versioning |
+| `PUT` | `/admin/buckets/{name}/policy` | Set/delete bucket policy |
+| `GET` | `/admin/buckets/usage` | Get bucket sizes via CloudWatch |
+| `GET` | `/admin/health` | Health check (DB + AWS connectivity) |
+
+Bucket creation via the admin API handles all AWS interaction internally:
+1. `HeadBucket` collision check.
+2. `CreateBucket` with `LocationConstraint`.
+3. Post-creation fixups (`DeletePublicAccessBlock`, `PutBucketOwnershipControls`).
+4. Insert bucket-account mapping into Postgres.
+
+### 6.4 STS Endpoint (port 8085)
+
+Handles `Action=AssumeRole` requests signed with CloudStack-issued credentials.
 
 **Flow:**
-1. Verify SigV4 against CloudStack-issued credentials.
-2. Look up account's buckets from CloudStack DB.
+1. Verify SigV4 against credentials in Postgres.
+2. Look up account's buckets from Postgres.
 3. Build session policy scoped to those buckets.
 4. Call `STS:AssumeRole` with session policy.
 5. Return temporary credentials in STS XML format.
 
-### 6.2 S3 Proxy
+Clients configure their AWS SDK to redirect STS to this endpoint (see section 4.5 Mode 1).
 
-Standalone Go service. Based on `~/s3-proxy-poc`.
+### 6.5 S3 Proxy Endpoint (port 9000)
 
-**Configuration:**
-- Same credential and bucket mapping source as STS proxy.
-- `AWS_ROLE_ARN`, `AWS_REGION`.
-- AWS service account credentials.
-- Listen address (default `:9000`).
-
-**Endpoints:**
-- `*` — all S3 API operations, proxied to `https://s3.<region>.amazonaws.com`.
+Proxies all S3 API operations to `https://s3.<region>.amazonaws.com`.
 
 **Flow:**
-1. Verify SigV4 against CloudStack-issued credentials.
+1. Verify SigV4 against credentials in Postgres.
 2. Obtain scoped STS credentials (cached per account, refreshed 5 min before expiry).
 3. Decode aws-chunked transfer encoding if present.
 4. Re-sign request with scoped credentials.
 5. Forward to S3, return response.
 
-**Bucket admin operations (CreateBucket, DeleteBucket) are rejected by the proxy** — these are handled by the CloudStack management server only.
+Bucket admin operations (CreateBucket, DeleteBucket) are rejected — these go through the admin API only.
+
+### 6.6 Horizontal Scalability
+
+Multiple middleware instances can run behind a load balancer. All instances share the same Postgres database. STS credential caches are per-instance (in-memory) and populated on demand. No inter-instance coordination is required.
+
+### 6.7 Local Development
+
+For local development, run Postgres in a container alongside the middleware:
+
+```bash
+podman run -d --name s3mw-postgres -p 5432:5432 \
+  -e POSTGRES_DB=s3middleware -e POSTGRES_USER=s3mw -e POSTGRES_PASSWORD=s3mw \
+  postgres:17
+```
 
 ## 7. Public Object Access
 
@@ -385,33 +446,32 @@ The CloudStack UI should display this URL for public objects. The proxy cannot s
 
 Since S3 bucket names are globally unique:
 
-1. `createBucket("my-bucket")` → provider calls `S3:HeadBucket("my-bucket")`.
+1. `createBucket("my-bucket")` → middleware calls `S3:HeadBucket("my-bucket")`.
 2. If 404 (not found) → proceed with `S3:CreateBucket`.
 3. If 200 or 403 (exists, owned by someone else) → return error: `"Bucket name 'my-bucket' is already taken in AWS S3. Please choose a different name."`.
-4. If the bucket exists and is owned by the same AWS account but not tracked in CloudStack's `bucket` table → return error: `"Bucket 'my-bucket' exists in the upstream store but is not managed by CloudStack."`.
+4. If the bucket exists and is owned by the same AWS account but not tracked in the middleware's database → return error: `"Bucket 'my-bucket' exists in the upstream store but is not managed by CloudStack."`.
 
 ## 9. Implementation Phases
 
-### Phase 1: CloudStack Plugin (MVP)
-- Implement `AWSS3ObjectStoreProviderImpl`, `AWSS3ObjectStoreDriverImpl`, `AWSS3ObjectStoreLifeCycleImpl`.
+### Phase 1: CloudStack Plugin (MVP) — DONE
+- Implemented `AWSS3ObjectStoreProviderImpl`, `AWSS3ObjectStoreDriverImpl`, `AWSS3ObjectStoreLifeCycleImpl`.
 - Bucket CRUD via CloudStack API and UI.
 - Credential generation and storage in `account_details`.
 - Bucket creation with post-creation fixups.
 - Region parameterization.
+- Note: The current driver calls AWS directly. Phase 2 will refactor it to call the middleware admin API instead.
 
-### Phase 2: STS Proxy
-- Port `~/sts-poc` to read credentials and bucket mappings from CloudStack DB.
-- Parameterize role ARN, region, listen address.
-- Deploy alongside management server.
+### Phase 2: S3 Middleware
+- Build the unified S3 middleware (single Go binary) with Postgres backing store.
+- Implement admin API for user/bucket management.
+- Port `~/sts-poc` STS endpoint to use Postgres for credential/bucket lookups.
+- Port `~/s3-proxy-poc` S3 proxy endpoint to use Postgres for credential/bucket lookups.
+- Preserve all S3 compatibility fixups (aws-chunked, SSE-C, post-creation fixups, header casing).
+- Reject bucket admin operations (CreateBucket/DeleteBucket) at S3 proxy level.
+- Refactor CloudStack driver to call middleware admin API instead of AWS directly.
 
-### Phase 3: S3 Proxy
-- Port `~/s3-proxy-poc` to read credentials and bucket mappings from CloudStack DB.
-- Preserve all S3 compatibility fixups (aws-chunked, SSE-C, CreateBucket fixups, header casing).
-- Reject bucket admin operations (CreateBucket/DeleteBucket) at proxy level.
-- Deploy alongside management server.
-
-### Phase 4: UI Integration
-- Display proxy connection instructions per account (STS proxy URL, S3 proxy URL, credentials).
+### Phase 3: UI Integration
+- Display middleware connection instructions per account (STS endpoint, S3 endpoint, credentials).
 - Show public object URLs pointing to upstream S3.
 - Bucket management through existing CloudStack Object Storage UI.
 
@@ -423,7 +483,7 @@ The operator must set up the following:
 2. **An IAM user** (service account) in that account with programmatic access and S3/STS permissions.
 3. **S3 access** in the target region.
 
-The service account credentials are used directly by the management server for bucket admin operations and by the proxies for STS AssumeRole calls.
+The service account credentials are configured in the S3 middleware. The CloudStack management server does not hold AWS credentials.
 
 ### Dev environment (current setup)
 
@@ -435,19 +495,28 @@ The service account credentials are used directly by the management server for b
 
 ## 11. Configuration Summary
 
-| Parameter | Where | Description |
+### CloudStack object store configuration (`object_store_details`)
+
+| Parameter | Key | Description |
 |---|---|---|
-| AWS Access Key | `object_store_details.accesskey` | Service account access key |
-| AWS Secret Key | `object_store_details.secretkey` | Service account secret key |
-| Region | `object_store_details.region` | AWS region (e.g., `sa-east-1`) |
-| Role ARN | `object_store_details.role-arn` | IAM role for STS session policy scoping |
-| STS Proxy URL | `object_store_details.sts-proxy-url` | For display to users |
-| S3 Proxy URL | `object_store_details.s3-proxy-url` | For display to users |
-| Object Store URL | `object_store.url` | S3 regional endpoint |
+| Admin URL | `adminurl` | S3 middleware admin API URL |
+| Region | `region` | AWS region (informational, for display) |
+| STS Endpoint | `sts-endpoint` | STS endpoint URL (for user display/client config) |
+| S3 Endpoint | `s3-endpoint` | S3 proxy endpoint URL (for user display/client config) |
 
-## 12. Proxy Compatibility Baseline
+### S3 middleware configuration (environment variables)
 
-The S3 proxy (`~/s3-proxy-poc`) has been extensively tuned against two S3 compatibility test suites. Any changes to proxy logic must preserve these results — regressions are not acceptable.
+| Parameter | Description |
+|---|---|
+| `DATABASE_URL` | Postgres connection string |
+| `AWS_ACCESS_KEY_ID` | Service account access key |
+| `AWS_SECRET_ACCESS_KEY` | Service account secret key |
+| `AWS_ROLE_ARN` | IAM role for STS AssumeRole |
+| `AWS_REGION` | Target S3 region |
+
+## 12. S3 Middleware Compatibility Baseline
+
+The S3 proxy endpoint (based on `~/s3-proxy-poc`) has been extensively tuned against two S3 compatibility test suites. Any changes to the S3 proxy logic in the middleware must preserve these results — regressions are not acceptable.
 
 ### Current test results (from s3-proxy-poc)
 
@@ -464,17 +533,23 @@ The S3 proxy (`~/s3-proxy-poc`) has been extensively tuned against two S3 compat
 
 ### Testing policy
 
-When modifying proxy code:
+When modifying S3 middleware proxy code:
 1. Run the full Ceph s3-tests suite and verify pass count does not decrease from the baseline in `~/s3-proxy-poc/README.md`.
 2. Run the MinIO Mint suites and verify no regressions.
 3. Follow the exact test setup and configuration documented in `~/s3-proxy-poc/README.md` (including the `s3tests-harness-fix.patch`).
-4. Preserve all proxy fixups (aws-chunked decoding, SSE-C pass-through, CreateBucket LocationConstraint injection, post-creation ACL/ownership fixups, bypass-governance retry, header casing). These were hand-tuned to pass the test suites — do not simplify, refactor, or remove them without re-running the full suites.
+4. Preserve all S3 proxy fixups (aws-chunked decoding, SSE-C pass-through, CreateBucket LocationConstraint injection, post-creation ACL/ownership fixups, bypass-governance retry, header casing). These were hand-tuned to pass the test suites — do not simplify, refactor, or remove them without re-running the full suites.
 
-## 13. Testing Strategy (CloudStack Plugin)
+## 13. Testing Strategy
 
-- Unit tests for driver methods (mock AWS SDK calls).
-- Integration tests against real S3 using the dev account credentials.
+### CloudStack Plugin
+- Unit tests for driver methods (mock middleware admin API calls).
+- Integration tests with middleware running against real S3.
 - Manual testing through CloudStack UI: create/delete buckets, verify in S3 console.
+
+### S3 Middleware
+- Unit tests for admin API, STS endpoint, S3 proxy logic.
+- Integration tests against real S3 using the dev account credentials.
+- S3 compatibility suites (Ceph s3-tests, MinIO Mint) — see section 12.
 
 ## 14. Backlog
 
