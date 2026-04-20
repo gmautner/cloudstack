@@ -75,6 +75,34 @@
           </a-form-item>
         </div>
 
+        <div v-else-if="form.provider === 'AWS-S3'">
+          <!-- AWS S3 Object Store Configuration -->
+          <a-form-item name="url" ref="url">
+            <template #label>
+              <tooltip-label :title="$t('label.url')" :tooltip="apiParams.url.description"/>
+            </template>
+            <a-input v-model:value="form.url" placeholder="https://s3.sa-east-1.amazonaws.com" />
+          </a-form-item>
+          <a-form-item name="adminUrl" ref="adminUrl" :label="$t('label.aws.s3.admin.url')" :rules="[{ required: true, message: this.$t('label.required') }]">
+            <a-input v-model:value="form.adminUrl" placeholder="http://s3-middleware:8090" />
+          </a-form-item>
+          <a-form-item name="adminApiKey" ref="adminApiKey" :label="$t('label.aws.s3.admin.apikey')" :rules="[{ required: true, message: this.$t('label.required') }]">
+            <a-input-password v-model:value="form.adminApiKey" autocomplete="off" />
+          </a-form-item>
+          <a-form-item name="s3Region" ref="s3Region" :label="$t('label.aws.s3.region')" :rules="[{ required: true, message: this.$t('label.required') }]">
+            <a-input v-model:value="form.s3Region" placeholder="sa-east-1" />
+          </a-form-item>
+          <a-form-item name="stsEndpoint" ref="stsEndpoint" :label="$t('label.aws.s3.sts.endpoint')">
+            <a-input v-model:value="form.stsEndpoint" placeholder="https://sts.example.com:8085" />
+          </a-form-item>
+          <a-form-item name="s3Endpoint" ref="s3Endpoint" :label="$t('label.aws.s3.s3.endpoint')">
+            <a-input v-model:value="form.s3Endpoint" placeholder="https://s3proxy.example.com:9090" />
+          </a-form-item>
+          <a-form-item name="roleArn" ref="roleArn" :label="$t('label.aws.s3.role.arn')">
+            <a-input v-model:value="form.roleArn" placeholder="arn:aws:iam::123456789012:role/cloudstack-s3" />
+          </a-form-item>
+        </div>
+
         <div v-else>
           <!-- Non-HyperStore Object Stores -->
           <a-form-item name="url" ref="url">
@@ -127,7 +155,7 @@ export default {
   inject: ['parentFetchData'],
   data () {
     return {
-      providers: ['MinIO', 'Ceph', 'Cloudian HyperStore', 'Simulator'],
+      providers: ['MinIO', 'Ceph', 'AWS-S3', 'Cloudian HyperStore', 'Simulator'],
       zones: [],
       loading: false
     }
@@ -148,9 +176,7 @@ export default {
       })
       this.rules = reactive({
         url: [{ required: true, message: this.$t('label.required') }],
-        name: [{ required: true, message: this.$t('label.required') }],
-        accessKey: [{ required: true, message: this.$t('label.required') }],
-        secretKey: [{ required: true, message: this.$t('label.required') }]
+        name: [{ required: true, message: this.$t('label.required') }]
       })
     },
     fetchData () {
@@ -173,18 +199,40 @@ export default {
 
         data.provider = provider
         data.url = values.url
-        data['details[0].key'] = 'accesskey'
-        data['details[0].value'] = values.accessKey
-        data['details[1].key'] = 'secretkey'
-        data['details[1].value'] = values.secretKey
 
-        if (provider === 'Cloudian HyperStore') {
-          data['details[2].key'] = 'validateSSL'
-          data['details[2].value'] = values.validateSSL
-          data['details[3].key'] = 's3Url'
-          data['details[3].value'] = values.s3Url
-          data['details[4].key'] = 'iamUrl'
-          data['details[4].value'] = values.iamUrl
+        if (provider === 'AWS-S3') {
+          data['details[0].key'] = 'adminurl'
+          data['details[0].value'] = values.adminUrl
+          data['details[1].key'] = 'apikey'
+          data['details[1].value'] = values.adminApiKey
+          data['details[2].key'] = 'region'
+          data['details[2].value'] = values.s3Region
+          if (values.stsEndpoint) {
+            data['details[3].key'] = 'sts-endpoint'
+            data['details[3].value'] = values.stsEndpoint
+          }
+          if (values.s3Endpoint) {
+            data['details[4].key'] = 's3-endpoint'
+            data['details[4].value'] = values.s3Endpoint
+          }
+          if (values.roleArn) {
+            data['details[5].key'] = 'role-arn'
+            data['details[5].value'] = values.roleArn
+          }
+        } else {
+          data['details[0].key'] = 'accesskey'
+          data['details[0].value'] = values.accessKey
+          data['details[1].key'] = 'secretkey'
+          data['details[1].value'] = values.secretKey
+
+          if (provider === 'Cloudian HyperStore') {
+            data['details[2].key'] = 'validateSSL'
+            data['details[2].value'] = values.validateSSL
+            data['details[3].key'] = 's3Url'
+            data['details[3].value'] = values.s3Url
+            data['details[4].key'] = 'iamUrl'
+            data['details[4].value'] = values.iamUrl
+          }
         }
 
         this.loading = true

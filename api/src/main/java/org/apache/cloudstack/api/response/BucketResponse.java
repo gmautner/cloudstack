@@ -110,6 +110,22 @@ public class BucketResponse extends BaseResponseWithTagInformation implements Co
     @Param(description = "Object storage provider")
     private String provider;
 
+    @SerializedName(ApiConstants.S3_STS_ENDPOINT)
+    @Param(description = "STS proxy endpoint URL for credential vending")
+    private String stsEndpoint;
+
+    @SerializedName(ApiConstants.S3_S3_ENDPOINT)
+    @Param(description = "S3 proxy endpoint URL for reverse proxy access")
+    private String s3Endpoint;
+
+    @SerializedName(ApiConstants.S3_OBJECT_STORE_REGION)
+    @Param(description = "AWS region for the object store")
+    private String region;
+
+    @SerializedName(ApiConstants.S3_ROLE_ARN)
+    @Param(description = "IAM role ARN for STS AssumeRole")
+    private String roleArn;
+
     public BucketResponse() {
         tags = new LinkedHashSet<ResourceTagResponse>();
     }
@@ -298,5 +314,37 @@ public class BucketResponse extends BaseResponseWithTagInformation implements Co
 
     public void setProvider(String provider) {
         this.provider = provider;
+    }
+
+    public String getStsEndpoint() {
+        return stsEndpoint;
+    }
+
+    public void setStsEndpoint(String stsEndpoint) {
+        this.stsEndpoint = stsEndpoint;
+    }
+
+    public String getS3Endpoint() {
+        return s3Endpoint;
+    }
+
+    public void setS3Endpoint(String s3Endpoint) {
+        this.s3Endpoint = s3Endpoint;
+    }
+
+    public String getRegion() {
+        return region;
+    }
+
+    public void setRegion(String region) {
+        this.region = region;
+    }
+
+    public String getRoleArn() {
+        return roleArn;
+    }
+
+    public void setRoleArn(String roleArn) {
+        this.roleArn = roleArn;
     }
 }

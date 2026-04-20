@@ -227,6 +227,7 @@ import org.apache.cloudstack.region.PortableIpRange;
 import org.apache.cloudstack.region.Region;
 import org.apache.cloudstack.secstorage.heuristics.Heuristic;
 import org.apache.cloudstack.storage.datastore.db.ObjectStoreDao;
+import org.apache.cloudstack.storage.datastore.db.ObjectStoreDetailsDao;
 import org.apache.cloudstack.storage.datastore.db.ObjectStoreVO;
 import org.apache.cloudstack.storage.datastore.db.PrimaryDataStoreDao;
 import org.apache.cloudstack.storage.datastore.db.SnapshotDataStoreDao;
@@ -536,6 +537,8 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
 
     @Inject
     ObjectStoreDao _objectStoreDao;
+    @Inject
+    ObjectStoreDetailsDao _objectStoreDetailsDao;
     @Inject
     VpcOfferingDao vpcOfferingDao;
     @Inject
@@ -5568,6 +5571,13 @@ public class ApiResponseHelper implements ResponseGenerator, ResourceIdSupport {
         bucketResponse.setObjectStoragePool(objectStoreVO.getName());
         bucketResponse.setObjectName("bucket");
         bucketResponse.setProvider(objectStoreVO.getProviderName());
+        if ("AWS-S3".equals(objectStoreVO.getProviderName())) {
+            Map<String, String> storeDetails = _objectStoreDetailsDao.getDetails(objectStoreVO.getId());
+            bucketResponse.setStsEndpoint(storeDetails.get("sts-endpoint"));
+            bucketResponse.setS3Endpoint(storeDetails.get("s3-endpoint"));
+            bucketResponse.setRegion(storeDetails.get("region"));
+            bucketResponse.setRoleArn(storeDetails.get("role-arn"));
+        }
         populateAccount(bucketResponse, bucket.getAccountId());
         return bucketResponse;
     }

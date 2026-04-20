@@ -1047,6 +1047,10 @@ public class ApiConstants {
     public static final String S3_CONNECTION_TTL = "connectionttl";
     public static final String S3_MAX_ERROR_RETRY = "maxerrorretry";
     public static final String S3_SOCKET_TIMEOUT = "sockettimeout";
+    public static final String S3_STS_ENDPOINT = "stsendpoint";
+    public static final String S3_S3_ENDPOINT = "s3endpoint";
+    public static final String S3_OBJECT_STORE_REGION = "s3region";
+    public static final String S3_ROLE_ARN = "rolearn";
     public static final String S3_USE_TCP_KEEPALIVE = "usetcpkeepalive";
     public static final String INCL_ZONES = "includezones";
     public static final String EXCL_ZONES = "excludezones";

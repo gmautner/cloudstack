@@ -612,8 +612,13 @@ export default {
           name: 'browser',
           resourceType: 'Bucket',
           component: shallowRef(defineAsyncComponent(() => import('@/components/view/ObjectStoreBrowser.vue'))),
-          show: (record) => { return record.provider !== 'Simulator' }
-
+          show: (record) => { return record.provider !== 'Simulator' && record.provider !== 'AWS-S3' }
+        },
+        {
+          name: 'connection',
+          resourceType: 'Bucket',
+          component: shallowRef(defineAsyncComponent(() => import('@/views/storage/AWSS3BucketConnection.vue'))),
+          show: (record) => { return record.provider === 'AWS-S3' }
         },
         {
           name: 'events',
