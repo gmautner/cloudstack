@@ -158,9 +158,10 @@ public class AWSS3ObjectStoreDriverImpl extends BaseObjectStoreDriverImpl {
             return true;
         }
 
-        String accountUuid = _accountDao.findById(accountId).getUuid();
+        com.cloud.user.Account account = _accountDao.findById(accountId);
         JsonObject body = new JsonObject();
-        body.addProperty("id", accountUuid);
+        body.addProperty("id", account.getUuid());
+        body.addProperty("name", account.getAccountName());
 
         JsonObject resp = adminPost(storeId, "/admin/users", body);
 
