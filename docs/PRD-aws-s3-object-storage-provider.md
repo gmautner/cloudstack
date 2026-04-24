@@ -89,9 +89,13 @@ No per-user IAM users or long-lived AWS keys are created in the upstream account
 
 CloudStack-issued credentials are synthetic: they authenticate requests to the middleware's STS and S3 endpoints. They have no meaning to AWS. The middleware verifies them via SigV4 signature verification and then calls `STS:AssumeRole` with a session policy scoped to that account's buckets. The CloudStack plugin also stores copies of these credentials in the `account_details` table for display in the UI.
 
-### 4.4 Transparent Bucket Naming
+### 4.4 Account-Prefixed Bucket Naming
 
-Bucket names visible to CloudStack users are identical to the actual S3 bucket names. No prefixing, mangling, or mapping. This is a hard requirement for STS credential forwarding — scoped IAM policies reference bucket ARNs by name. Users have full freedom to choose any valid S3 bucket name.
+Bucket names **must start with the CloudStack account name**. For example, if the account is `johndoe`, valid bucket names include `johndoe-docs`, `johndoe-photos-2024`, etc. The middleware enforces this on bucket creation.
+
+This convention enables the session policy to use a wildcard ARN (`arn:aws:s3:::johndoe*`) instead of listing each bucket individually, keeping the policy at a constant size regardless of how many buckets an account has. This eliminates the AWS STS 2048-byte packed policy size limit.
+
+Bucket names visible to CloudStack users are identical to the actual S3 bucket names — no additional prefixing or mangling beyond the account name prefix chosen by the user.
 
 Since S3 bucket names are globally unique, the provider must handle name collisions:
 - On `createBucket`, call S3 `HeadBucket` first.
@@ -209,7 +213,8 @@ The `url` field on the object store itself will hold the S3 middleware admin API
 Extends `BaseObjectStoreDriverImpl`. The driver is a thin wrapper that delegates all operations to the S3 middleware via its admin API, following the same pattern as the MinIO driver delegates to MinIO. No AWS SDK calls are made from the Java side.
 
 #### createUser(accountId, storeId)
-- Call middleware admin API: `POST /admin/users` with account identifier.
+- Call middleware admin API: `POST /admin/users` with account UUID and account name.
+- The account name is used as the bucket name prefix for session policy scoping (see section 5.6).
 - Middleware generates the synthetic access/secret key pair and stores them in its Postgres database.
 - Driver receives the credentials in the response and stores them in `account_details` table (keys `s3-accesskey`, `s3-secretkey`) for display in the CloudStack UI.
 
@@ -267,61 +272,38 @@ This follows the same pattern as the MinIO provider's `minio-accesskey` / `minio
 
 Bucket lifecycle and settings are managed exclusively through CloudStack. The session policy must deny all bucket-level administrative operations so users cannot bypass CloudStack by calling S3 directly.
 
-When the S3 middleware needs to build a session policy for a given account, it:
-
-1. Queries its Postgres database for all buckets mapped to that account.
-2. Builds a policy document with an explicit deny for bucket admin operations:
+When the S3 middleware needs to build a session policy for a given account, it uses the account name as a wildcard prefix:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowObjectOperations",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:ListBucket",
-        "s3:GetBucketLocation",
-        "s3:ListBucketMultipartUploads",
-        "s3:ListMultipartUploadParts",
-        "s3:AbortMultipartUpload",
-        "s3:PutObjectAcl",
-        "s3:GetObjectAcl",
-        "s3:GetObjectVersion",
-        "s3:DeleteObjectVersion",
-        "s3:PutObjectTagging",
-        "s3:GetObjectTagging",
-        "s3:DeleteObjectTagging"
-      ],
+      "Action": "s3:*",
       "Resource": [
-        "arn:aws:s3:::<bucket1>",
-        "arn:aws:s3:::<bucket1>/*",
-        "arn:aws:s3:::<bucket2>",
-        "arn:aws:s3:::<bucket2>/*"
+        "arn:aws:s3:::<accountname>*",
+        "arn:aws:s3:::<accountname>*/*"
       ]
     },
     {
-      "Sid": "DenyBucketAdmin",
       "Effect": "Deny",
       "Action": [
-        "s3:ListAllMyBuckets",
         "s3:CreateBucket",
         "s3:DeleteBucket",
         "s3:PutBucketVersioning",
-        "s3:PutEncryptionConfiguration",
-        "s3:DeleteEncryptionConfiguration",
         "s3:PutBucketPolicy",
         "s3:DeleteBucketPolicy",
         "s3:PutBucketAcl",
         "s3:PutBucketOwnershipControls",
+        "s3:PutBucketTagging",
+        "s3:DeleteBucketTagging",
+        "s3:ListAllMyBuckets",
+        "s3:PutEncryptionConfiguration",
+        "s3:DeleteEncryptionConfiguration",
         "s3:PutPublicAccessBlock",
         "s3:DeletePublicAccessBlock",
-        "s3:PutObjectLockConfiguration",
-        "s3:PutBucketTagging",
-        "s3:DeleteBucketTagging"
+        "s3:PutObjectLockConfiguration"
       ],
       "Resource": "arn:aws:s3:::*"
     }
@@ -330,12 +312,12 @@ When the S3 middleware needs to build a session policy for a given account, it:
 ```
 
 **Design rationale:**
-- The Allow statement uses an explicit action list (not `s3:*`) to grant only object-level data operations on the account's specific buckets.
-- The Deny statement explicitly blocks all bucket-level administrative operations and `ListAllMyBuckets`. Even if the Allow list is accidentally broadened, the Deny takes precedence (AWS always honors explicit Deny over Allow).
+- The Allow statement uses `s3:*` with a wildcard resource scoped to the account name prefix (`arn:aws:s3:::accountname*`). This keeps the policy at a constant size regardless of bucket count, eliminating the AWS STS 2048-byte packed policy size limit. The account-prefixed bucket naming convention (see section 4.4) ensures isolation — each account can only access buckets whose names start with their own account name.
+- The Deny statement explicitly blocks all bucket-level administrative operations and `ListAllMyBuckets`. AWS always honors explicit Deny over Allow, so even though the Allow grants `s3:*`, bucket-admin operations are still blocked.
 - `ListAllMyBuckets` is denied because it cannot be scoped to specific buckets in AWS and would expose all bucket names in the account. Bucket listing is a CloudStack-level feature served from the CloudStack database, not from S3.
 - Bucket creation/deletion, versioning, encryption, policies, ACLs, public access, and object lock configuration are all reserved for the middleware's admin API, which uses the service account credentials directly (not STS).
 
-3. Passes this as the `Policy` parameter to `STS:AssumeRole`.
+The middleware passes this policy as the `Policy` parameter to `STS:AssumeRole`.
 
 AWS enforces the intersection of this session policy with the role's permission policy, ensuring a user can never access buckets outside their own set or perform bucket admin operations.
 
@@ -362,7 +344,7 @@ Single Go binary that consolidates the STS proxy, S3 proxy, and admin API into o
 
 The middleware owns its database with (at minimum) these tables:
 
-- **`accounts`**: account identifier, access key, secret key.
+- **`accounts`**: account identifier (CloudStack UUID), account name (bucket prefix), access key, secret key.
 - **`buckets`**: bucket name, account FK, created timestamp.
 
 The middleware is the source of truth for credentials and bucket mappings. CloudStack holds copies in its own database for UI display only.
@@ -376,7 +358,7 @@ Internal API called by the CloudStack plugin driver. Not exposed to end users. S
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/admin/users` | Create account with generated credentials |
+| `POST` | `/admin/users` | Create account with generated credentials (requires `id` and `name`) |
 | `GET` | `/admin/users/{id}` | Get account credentials |
 | `DELETE` | `/admin/users/{id}` | Delete account |
 | `POST` | `/admin/buckets` | Create bucket (S3 + Postgres) |

@@ -310,14 +310,20 @@ When objects have public access (via bucket policy), anonymous downloads bypass 
 - `https://s3.<region>.amazonaws.com/<bucket>/<key>`
 - `https://<bucket>.s3.<region>.amazonaws.com/<key>`
 
+## Bucket Naming Convention
+
+Bucket names **must start with the CloudStack account name**. For example, if the account is `johndoe`, valid bucket names include `johndoe-docs`, `johndoe-photos-2024`, etc. The middleware enforces this on bucket creation.
+
+This convention enables constant-size STS session policies — the policy uses a wildcard ARN (`arn:aws:s3:::johndoe*`) instead of listing each bucket individually, eliminating the AWS 2048-byte packed policy size limit regardless of how many buckets an account has.
+
 ## Tenant Isolation
 
 Isolation is enforced through STS session policies. When the middleware issues temporary credentials (via STS or the S3 proxy), it builds a per-account policy that:
 
-- **Allows** object-level data operations (`GetObject`, `PutObject`, `DeleteObject`, `ListBucket`, etc.) only on buckets owned by that CloudStack account.
+- **Allows** all S3 data operations (`s3:*`) on buckets matching the account name prefix (`arn:aws:s3:::accountname*`).
 - **Denies** all bucket-level administrative operations (`CreateBucket`, `DeleteBucket`, `PutBucketVersioning`, `PutBucketPolicy`, etc.) and `ListAllMyBuckets`.
 
-Bucket lifecycle is managed exclusively through CloudStack. Users cannot bypass CloudStack by calling S3 directly.
+The Allow uses `s3:*` because the explicit Deny takes precedence for bucket-admin operations (AWS always honors explicit Deny over Allow). Bucket lifecycle is managed exclusively through CloudStack. Users cannot bypass CloudStack by calling S3 directly.
 
 ## Object Store Browser
 
