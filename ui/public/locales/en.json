@@ -458,6 +458,7 @@
 "label.availablevirtualmachinecount": "Available Instances",
 "label.aws.s3.admin.apikey": "Middleware Admin API Key",
 "label.aws.s3.admin.url": "Middleware Admin URL",
+"label.aws.s3.bucket.name.hint": "Bucket name must start with \"{account}-\"",
 "label.aws.s3.connection": "Connection",
 "label.aws.s3.connection.public.url": "Public Object URL",
 "label.aws.s3.connection.s3proxy.description": "Route all S3 operations through the S3 proxy. Best for legacy software or restricted networks.",

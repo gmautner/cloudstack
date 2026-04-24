@@ -27,6 +27,9 @@
        >
         <a-form-item name="name" ref="name" :label="$t('label.name')">
           <a-input v-model:value="form.name" v-focus="true" />
+          <div v-if="selectedProviderIsAwsS3" class="bucket-name-hint">
+            {{ $t('label.aws.s3.bucket.name.hint', { account: accountName }) }}
+          </div>
         </a-form-item>
         <a-form-item name="objectstore" ref="objectstore" :label="$t('label.object.storage')">
           <a-select
@@ -94,6 +97,7 @@ import { ref, reactive, toRaw } from 'vue'
 import { getAPI, postAPI } from '@/api'
 import { mixinForm } from '@/utils/mixin'
 import ResourceIcon from '@/components/view/ResourceIcon'
+import store from '@/store'
 
 export default {
   name: 'CreateBucket',
@@ -110,7 +114,18 @@ export default {
   inject: ['parentFetchData'],
   data () {
     return {
-      loading: false
+      loading: false,
+      objectstores: []
+    }
+  },
+  computed: {
+    accountName () {
+      return store.getters.userInfo.account || ''
+    },
+    selectedProviderIsAwsS3 () {
+      if (!this.objectstores || !this.form.objectstore) return false
+      const selected = this.objectstores.find(s => s.id === this.form.objectstore)
+      return selected && selected.providername === 'AWS-S3'
     }
   },
   created () {
@@ -193,5 +208,11 @@ export default {
   @media (min-width: 1000px) {
     width: 35vw;
   }
+}
+
+.bucket-name-hint {
+  color: rgba(0, 0, 0, 0.45);
+  font-size: 13px;
+  margin-top: 4px;
 }
 </style>
