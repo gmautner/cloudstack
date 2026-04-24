@@ -128,6 +128,16 @@ export default {
       return selected && selected.providername === 'AWS-S3'
     }
   },
+  computed: {
+    accountName () {
+      return store.getters.userInfo.account || ''
+    },
+    selectedProviderIsAwsS3 () {
+      if (!this.objectstores || !this.form.objectstore) return false
+      const selected = this.objectstores.find(s => s.id === this.form.objectstore)
+      return selected && selected.providername === 'AWS-S3'
+    }
+  },
   created () {
     this.initForm()
     this.policyList = ['Public', 'Private']
